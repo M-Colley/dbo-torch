@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbo-torch"
+version = "0.1.0"
+description = "Dynamic Bayesian Optimization for non-stationary human-in-the-loop problems, built on BoTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Mark Colley", email = "m.colley@ucl.ac.uk" }]
+keywords = [
+    "bayesian-optimization",
+    "non-stationary",
+    "human-in-the-loop",
+    "botorch",
+    "gaussian-process",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "botorch>=0.11",
+    "gpytorch>=1.11",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.4"]
+plot = ["matplotlib>=3.7"]
+parity = ["scipy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/M-Colley/dbo-torch"
+Issues = "https://github.com/M-Colley/dbo-torch/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::UserWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

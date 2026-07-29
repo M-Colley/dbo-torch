@@ -1,0 +1,31 @@
+# --- Licensing safety net -------------------------------------------------
+# BayesianOptimization.m is MathWorks-copyrighted toolbox source and must never
+# be committed to this repository. See PROVENANCE.md.
+BayesianOptimization.m
+**/BayesianOptimization.m
+*.m.orig
+matlab_parity/vendor/
+
+# --- Parity artefacts -----------------------------------------------------
+matlab_parity/out/
+*.mat
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ---------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
