@@ -84,44 +84,59 @@ DBOConfig(model=DBOModelConfig(stationary=True))   # BO baseline
 
 ## 4. Run the comparison
 
-Two tiers, each a MATLAB generator paired with a Python checker. Tier 1
-(`kernel_reference.m`) needs only base MATLAB; Tier 2 (`gp_reference.m`) needs
-the Statistics and Machine Learning Toolbox from step 1.
+Three tiers, each a MATLAB generator paired with a Python checker. Tier 1
+(`kernel_reference.m`) needs only base MATLAB; Tiers 2 (`gp_reference.m`) and
+3 (`fit_reference.m`) need the Statistics and Machine Learning Toolbox from
+step 1.
 
 ```bash
-matlab -batch "cd('matlab_parity'); kernel_reference; gp_reference"
+matlab -batch "cd('matlab_parity'); kernel_reference; gp_reference; fit_reference"
 python matlab_parity/compare_kernel.py
 python matlab_parity/compare_gp.py
+python matlab_parity/compare_fit.py
 ```
 
 If `matlab` is not on your PATH (a default Windows install does not add it),
 use the full executable path, e.g.
 `"C:\Program Files\MATLAB\R2019b\bin\matlab.exe" -batch ...`.
 
-The generators write `out/matlab_kernel.json` and `out/matlab_gp.json`; each
-compare script accepts an optional path to the JSON and defaults to those
-locations. `compare_kernel.py` rebuilds the covariance matrices with the
-GPyTorch kernel at pinned hyperparameters; `compare_gp.py` rebuilds the full
-GP posteriors against MATLAB's `fitrgp`, probing both at the current time and
-back at t = 1, where the temporal kernel does the work that distinguishes DBO
-from stationary BO.
+The generators write `out/matlab_kernel.json`, `out/matlab_gp.json` and
+`out/matlab_fit.json`; each compare script accepts an optional path to the
+JSON and defaults to those locations. `compare_kernel.py` rebuilds the
+covariance matrices with the GPyTorch kernel at pinned hyperparameters;
+`compare_gp.py` rebuilds the full GP posteriors against MATLAB's `fitrgp`,
+probing both at the current time and back at t = 1, where the temporal kernel
+does the work that distinguishes DBO from stationary BO. `compare_fit.py`
+checks fitting: `fit_reference.m` fits five data sets the way the reference
+implementation does, and the Python side must start from the same point,
+reproduce MATLAB's likelihood at MATLAB's optimum, and fit to an optimum at
+least as good.
 
 ## What agreement to expect
 
-Everything these tiers check is deterministic linear algebra with pinned
-hyperparameters — no fitting, no acquisition, no randomness — so the two sides
-must agree to near machine precision. Anything worse than the tolerances below
-is a structural difference, not rounding:
+Tiers 1 and 2 are deterministic linear algebra with pinned hyperparameters —
+no fitting, no acquisition, no randomness — so the two sides must agree to
+near machine precision. Anything worse than the tolerances below is a
+structural difference, not rounding:
 
 | Quantity | Expected agreement |
 |---|---|
 | Kernel matrix for fixed hyperparameters | ~1e-12 (pure arithmetic) |
 | Posterior mean and sd for fixed hyperparameters | ~1e-8 (one Cholesky solve apart) |
+| Fitting starting point (`matlab_compatible()`) | ~1e-10 (pure arithmetic) |
+| Log likelihood at MATLAB's fitted hyperparameters | ~1e-8 relative |
+| Python's fitted log likelihood | no worse than MATLAB's, within 1e-3 |
 
-Deliberately out of scope: fitted hyperparameters, per-iteration selected
-inputs, and full optimisation trajectories. MATLAB and BoTorch use different
-optimisers over a genuinely multi-modal likelihood surface, so those can only
-ever agree qualitatively, and a comparison that mixes optimiser variance into
-a correctness check would mask real bugs. The kernel and posterior tiers are
-the correctness statement; behavioural reproduction is demonstrated separately
-by `examples/replicate_ral.py`.
+Tier 3 deliberately does not require the fitted hyperparameters to agree.
+MATLAB and BoTorch use different optimisers over a genuinely multi-modal
+likelihood surface, and a check that demanded equal optima would mix optimiser
+variance into a correctness statement. Instead it splits into a deterministic
+part (same start, same likelihood function) and a one-sided quality part
+(Python's optimum is at least as good), either of which a real porting error
+would break. In practice the optima coincide: on the shipped cases the fitted
+likelihoods agree to four decimals and the fitted `alpha` to five.
+
+Still out of scope: per-iteration selected inputs and full optimisation
+trajectories, which depend on acquisition optimisers and random restarts.
+Behavioural reproduction is demonstrated separately by
+`examples/replicate_ral.py`.

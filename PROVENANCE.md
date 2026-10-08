@@ -72,6 +72,14 @@ hidden, and are covered by the BSD notice in `LICENSE`.
 | Time coordinate | The iteration index (1, 2, 3, …), not wall-clock time. |
 | Time column | Appended as the last column of the GP training inputs. |
 
+For parity runs, `DBOModelConfig.matlab_compatible()` also reproduces three
+numerical conventions of the stock toolbox's GP fitting: a starting lengthscale
+of half the domain width, starting signal and noise standard deviations of
+`std(Y)/√2`, and a noise floor of 1% of `std(Y)` (never below `1e-6`). These
+are numerical defaults, not code. They are re-expressed here from scratch, and
+the Tier 3 parity check verifies them against `fitrgp`'s actual behaviour
+rather than against any copied source.
+
 Everything else here — the BoTorch/GPyTorch model construction, the acquisition
 optimisation, the validation-iteration logic, the API surface,
 the tests — is original.

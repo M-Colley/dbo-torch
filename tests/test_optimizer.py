@@ -344,24 +344,25 @@ def test_acquisition_time_offset_is_applied():
 def test_acquisition_time_offset_reaches_the_acquisition_search(monkeypatch):
     """The offset must shift the time the acquisition is actually pinned to,
     not just the helper's arithmetic."""
-    import dbo_torch.optimizer as optimizer_module
+    import dbo_torch._base as base_module
 
-    real = optimizer_module.optimize_acqf
+    real = base_module.optimize_acqf
     pinned = []
 
     def spy(*args, **kwargs):
         pinned.append(dict(kwargs["fixed_features"]))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(optimizer_module, "optimize_acqf", spy)
+    monkeypatch.setattr(base_module, "optimize_acqf", spy)
 
     opt = make_optimizer(acquisition_time_offset=1.0, validation_every=None)
     opt.run(drifting_objective(noise=0.05), 6)
 
     assert pinned
     # 3 seeds, so acquisition runs when 3, 4, 5 observations exist; with an
-    # offset of 1 the pinned time is n_observations + 1. The exploration guard
-    # may re-search at the same pinned time, so compare distinct values.
+    # offset of 1 the pinned time is n_observations + 1. The incumbent search
+    # and the exploration guard search at the same pinned time, so compare
+    # distinct values.
     times = sorted({p[opt.dim] for p in pinned})
     assert times == pytest.approx([4.0, 5.0, 6.0])
 
@@ -394,3 +395,238 @@ def test_matlab_compatible_model_runs():
     )
     opt.run(drifting_objective(noise=0.05), 10)
     assert 0.0 < opt.alpha <= 1.0
+
+
+# -- randomness ---------------------------------------------------------
+
+
+def test_suggest_leaves_the_global_rng_untouched():
+    state = torch.random.get_rng_state()
+    opt = make_optimizer(seed_points=None)
+    opt.run(drifting_objective(noise=0.05), 5)
+    assert torch.equal(torch.random.get_rng_state(), state)
+
+
+def test_other_code_cannot_perturb_a_run():
+    """A second optimiser built and stepped mid-run (a BO arm beside a DBO
+    arm, say), or unrelated draws from the global RNG, must not change the
+    first run's suggestions."""
+
+    def run(interleave: bool) -> list[list[float]]:
+        opt = make_optimizer(seed_points=None)
+        objective = drifting_objective(noise=0.05)
+        xs = []
+        for _ in range(5):
+            if interleave:
+                make_optimizer(seed=123, seed_points=None).suggest()
+                torch.rand(7)
+            x = opt.suggest()
+            xs.append(x)
+            opt.observe(x, objective(x))
+        return xs
+
+    assert run(interleave=True) == run(interleave=False)
+
+
+# -- predictions --------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset", [0.0, 1.0])
+def test_prediction_is_made_when_the_point_will_be_measured(offset):
+    """The recorded prediction must refer to the time the measurement is
+    taken, whatever time the acquisition function scored candidates at."""
+    from dbo_torch.model import posterior_mean_std
+
+    opt = make_optimizer(validation_every=None, acquisition_time_offset=offset)
+    opt.run(drifting_objective(noise=0.05), 5)
+
+    x = opt.suggest()
+    model = opt._ensure_model()
+    point = torch.tensor([x + [float(opt.next_iteration)]])
+    mu, sd = posterior_mean_std(model, point)
+
+    assert opt._pending["predicted_y"] == pytest.approx(mu.item())
+    assert opt._pending["predicted_sd"] == pytest.approx(sd.item())
+    assert opt.observe(x, 1.0).time == float(opt.num_observations)
+
+
+def test_optimiser_normalises_against_its_domain():
+    opt = make_optimizer()
+    opt.run(drifting_objective(), 4)
+    tf = opt._ensure_model().input_transform
+    lo = tf.offset[..., 0].item()
+    width = tf.coefficient[..., 0].item()
+    assert (lo, lo + width) == pytest.approx((-5.0, 9.0))
+
+
+# -- search quality -----------------------------------------------------
+
+
+def _grid_at(t: float) -> torch.Tensor:
+    grid = torch.linspace(-5.0, 9.0, 2801).unsqueeze(-1)
+    return torch.cat([grid, torch.full_like(grid, t)], dim=-1)
+
+
+def test_incumbent_finds_the_minimum_of_the_posterior_mean():
+    from dbo_torch.model import posterior_mean_std
+
+    opt = make_optimizer(num_restarts=8, raw_samples=128, validation_every=None)
+    opt.run(drifting_objective(noise=0.05), 10)
+    model = opt._ensure_model()
+    t = opt._acquisition_time()
+
+    mu, _ = posterior_mean_std(model, _grid_at(t))
+    assert opt._incumbent(model, t) <= float(mu.min()) + 1e-4
+
+
+def test_continuous_validation_minimises_the_upper_bound():
+    from dbo_torch.model import posterior_mean_std
+    from dbo_torch.optimizer import _z_score
+
+    opt = make_optimizer(validation_visited_only=False, num_restarts=8, raw_samples=128)
+    opt.run(drifting_objective(noise=0.05), 10)
+    model = opt._ensure_model()
+    t = opt._acquisition_time()
+    k = _z_score(1.0 - opt.config.validation_confidence)
+
+    def bound(X):
+        mu, sd = posterior_mean_std(model, X)
+        return mu + k * sd
+
+    x = opt.suggest_validation()
+    chosen = bound(torch.tensor([x + [t]]))
+    assert float(chosen) <= float(bound(_grid_at(t)).min()) + 1e-4
+
+
+def test_incumbent_is_computed_once_per_suggestion(monkeypatch):
+    """The over-exploitation guard re-searches EI; the incumbent is a property
+    of the fitted model and must not be recomputed for every re-search."""
+    opt = make_optimizer(validation_every=None, max_exploit_iterations=3)
+    opt.run(drifting_objective(noise=0.05), 4)
+
+    calls = {"incumbent": 0, "ei": 0}
+    real_incumbent, real_ei = DynamicBO._incumbent, DynamicBO._argmax_ei
+
+    def incumbent(self, *a, **k):
+        calls["incumbent"] += 1
+        return real_incumbent(self, *a, **k)
+
+    def ei(self, *a, **k):
+        calls["ei"] += 1
+        return real_ei(self, *a, **k)
+
+    monkeypatch.setattr(DynamicBO, "_incumbent", incumbent)
+    monkeypatch.setattr(DynamicBO, "_argmax_ei", ei)
+    monkeypatch.setattr(DynamicBO, "_exploiting_too_much", lambda *a: True)
+
+    opt.suggest()
+    assert calls == {"incumbent": 1, "ei": 4}
+
+
+# -- warm start ---------------------------------------------------------
+
+
+def test_warm_start_refits_from_the_previous_fit(monkeypatch):
+    import dbo_torch._base as base_module
+
+    starts = []
+    real_fit = base_module.fit_model
+
+    def spy(model, *args, **kwargs):
+        kernel = model.covar_module.kernels[0].base_kernel
+        starts.append(kernel.lengthscale.detach().clone())
+        return real_fit(model, *args, **kwargs)
+
+    monkeypatch.setattr(base_module, "fit_model", spy)
+
+    opt = make_optimizer(warm_start=True, validation_every=None)
+    objective = drifting_objective(noise=0.05)
+    opt.run(objective, 4)  # the fourth suggestion fits cold, at n = 3
+    fitted = opt._model.covar_module.kernels[0].base_kernel.lengthscale.detach().clone()
+
+    opt.suggest()  # refit at n = 4 starts from the n = 3 fit
+    torch.testing.assert_close(starts[-1], fitted)
+
+
+# -- save and resume ----------------------------------------------------
+
+
+def _deterministic_cost(x: list[float], iteration: int) -> float:
+    return abs(x[0] - 5.0 * (1.0 - (iteration - 1) / (N - 1)))
+
+
+def test_resumed_run_continues_exactly(tmp_path):
+    """A study that crashes and resumes from its last save must produce the
+    same suggestions as one that never stopped, including an outstanding
+    suggestion made before the crash."""
+    a = make_optimizer(validation_every=4)
+    for _ in range(6):
+        x = a.suggest()
+        a.observe(x, _deterministic_cost(x, a.next_iteration))
+    outstanding = a.suggest()
+
+    b = DynamicBO.load(a.save(tmp_path / "run.json"))
+    assert b.history() == a.history()
+    assert b.config == a.config
+
+    for opt in (a, b):
+        opt.observe(outstanding, _deterministic_cost(outstanding, opt.next_iteration))
+    assert b.observations[-1] == a.observations[-1]
+
+    for _ in range(3):
+        xa, xb = a.suggest(), b.suggest()
+        assert xb == pytest.approx(xa, abs=1e-9)
+        a.observe(xa, _deterministic_cost(xa, a.next_iteration))
+        b.observe(xb, _deterministic_cost(xb, b.next_iteration))
+    assert b.alpha == pytest.approx(a.alpha)
+
+
+def test_save_records_the_full_configuration_and_versions(tmp_path):
+    opt = make_optimizer(validation_every=5, refit_every=2)
+    opt.run(drifting_objective(noise=0.05), 4)
+    path = opt.save(tmp_path / "run.json")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["kind"] == "DynamicBO"
+    assert payload["config"]["refit_every"] == 2
+    assert payload["config"]["seed"] == 0
+    assert payload["config"]["dtype"] == "float64"
+    assert payload["config"]["model"]["stationary"] is False
+    assert payload["versions"]["botorch"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_load_reads_files_from_the_first_save_format(tmp_path):
+    old = {
+        "bounds": [[-5.0, 9.0]],
+        "alpha": 1.0,
+        "config": {
+            "exploration_ratio": 0.1,
+            "validation_every": 10,
+            "validation_confidence": 0.01,
+            "acquisition_time_offset": 0.0,
+            "stationary": True,
+        },
+        "observations": [
+            {
+                "iteration": 1, "x": [5.0], "y": 1.0, "time": 1.0,
+                "is_validation": False, "predicted_y": None, "predicted_sd": None,
+            },
+        ],
+    }
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(old), encoding="utf-8")
+
+    opt = DynamicBO.load(path)
+    assert opt.config.model.stationary is True
+    assert opt.config.validation_every == 10
+    assert opt.num_observations == 1
+
+
+def test_load_refuses_a_multi_objective_run(tmp_path):
+    from dbo_torch import DynamicMOBO
+
+    mo = DynamicMOBO(bounds=[(-5.0, 9.0)], ref_point=[10.0, 10.0])
+    path = mo.save(tmp_path / "mo.json")
+    with pytest.raises(ValueError, match="DynamicMOBO run"):
+        DynamicBO.load(path)

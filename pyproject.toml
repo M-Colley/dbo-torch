@@ -45,7 +45,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["ignore::UserWarning"]
+filterwarnings = [
+    # matlab_compatible() switches input scaling off on purpose.
+    "ignore::botorch.exceptions.warnings.InputDataWarning",
+    # Environment-specific: without a C++ compiler BoTorch falls back to Python.
+    "ignore:Failed to compile fused:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100
