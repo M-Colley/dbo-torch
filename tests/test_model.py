@@ -238,3 +238,115 @@ def test_get_alpha_finds_kernel_in_foreign_model():
     foreign = SingleTaskGP(train_X=X, train_Y=Y, covar_module=covar)
 
     assert get_alpha(foreign) == pytest.approx(0.42)
+
+
+# -- normalisation, reference starting point, bookkeeping ---------------
+
+
+def test_normalisation_maps_the_domain_not_the_data():
+    """With bounds given, the domain maps onto the unit cube whatever has been
+    observed, so a lengthscale means the same thing at every iteration."""
+    X = torch.tensor([[5.0, 1.0], [7.0, 2.0], [3.0, 3.0]])
+    Y = torch.tensor([[1.0], [2.0], [0.5]])
+    model = build_model(X, Y, bounds=torch.tensor([[-5.0], [9.0]]))
+
+    tf = model.input_transform
+    lo = tf.offset[..., 0].item()
+    width = tf.coefficient[..., 0].item()
+    assert (lo, lo + width) == pytest.approx((-5.0, 9.0))
+
+
+def test_bounds_shape_is_checked():
+    X, Y = drifting_data(n=10)
+    with pytest.raises(ValueError, match="bounds must have shape"):
+        build_model(X, Y, bounds=torch.tensor([[-5.0, 0.0], [9.0, 1.0]]))
+
+
+def test_time_column_does_not_trigger_the_input_scaling_warning():
+    """Time is unnormalised by design; BoTorch must not warn about it on every
+    model build."""
+    import warnings
+
+    from botorch.exceptions.warnings import InputDataWarning
+
+    X, Y = drifting_data(n=40)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        build_model(X, Y, bounds=torch.tensor([[-5.0], [9.0]]))
+    assert not [w for w in caught if issubclass(w.category, InputDataWarning)]
+
+
+def test_matlab_compatible_starts_where_the_reference_does():
+    """Lengthscale of half the domain width, signal and noise SD of
+    std(Y)/sqrt(2), and a noise floor of 1% of std(Y)."""
+    X, Y = drifting_data(n=12)
+    model = build_model(
+        X, Y, DBOModelConfig.matlab_compatible(), bounds=torch.tensor([[-5.0], [9.0]])
+    )
+    sd = float(Y.std())
+
+    lengthscale = model.covar_module.kernels[0].base_kernel.lengthscale
+    outputscale = model.covar_module.kernels[0].outputscale
+    floor = model.likelihood.noise_covar.raw_noise_constraint.lower_bound
+
+    assert lengthscale.item() == pytest.approx(7.0)
+    assert outputscale.item() == pytest.approx(sd**2 / 2)
+    assert model.likelihood.noise.item() == pytest.approx(sd**2 / 2)
+    assert floor.item() == pytest.approx((0.01 * sd) ** 2)
+
+
+def test_reference_init_in_normalised_coordinates():
+    X, Y = drifting_data(n=12)
+    config = DBOModelConfig(reference_init=True)
+    model = build_model(X, Y, config, bounds=torch.tensor([[-5.0], [9.0]]))
+    lengthscale = model.covar_module.kernels[0].base_kernel.lengthscale
+    assert lengthscale.item() == pytest.approx(0.5)
+
+
+def test_relative_noise_floor_has_an_absolute_minimum():
+    X, _ = drifting_data(n=6)
+    Y = torch.full((6, 1), 3.0)  # constant data: zero spread
+    config = DBOModelConfig(standardize_outcome=False, noise_floor_fraction=0.01)
+    floor = build_model(X, Y, config).likelihood.noise_covar.raw_noise_constraint.lower_bound
+    assert floor.item() == pytest.approx(1e-12)
+
+
+def test_initial_alpha_of_one_is_rejected_by_the_model():
+    X, Y = drifting_data(n=10)
+    with pytest.raises(ValueError, match="stationary=True"):
+        build_model(X, Y, DBOModelConfig(initial_alpha=1.0))
+
+
+def test_multistart_keeps_the_best_fit():
+    """With several starts, the kept fit must be at least as likely as each
+    start fitted on its own."""
+    from dbo_torch.model import _total_log_likelihood
+
+    X, Y = drifting_data(n=15, seed=8)
+    bounds = torch.tensor([[-5.0], [9.0]])
+
+    singles = [
+        _total_log_likelihood(
+            fit_model(build_model(X, Y, bounds=bounds), lengthscale_starts=(factor,))
+        )
+        for factor in (1.0, 0.25)
+    ]
+    best = fit_model(build_model(X, Y, bounds=bounds), lengthscale_starts=(1.0, 0.25))
+    assert _total_log_likelihood(best) >= max(singles) - 1e-6
+
+
+def test_lengthscale_starts_must_be_positive_factors():
+    X, Y = drifting_data(n=10)
+    for bad in ((), (1.0, 0.0)):
+        with pytest.raises(ValueError, match="lengthscale_starts"):
+            fit_model(build_model(X, Y), lengthscale_starts=bad)
+
+
+def test_matlab_compatible_fits_once_as_the_reference_does():
+    assert DBOModelConfig.matlab_compatible().lengthscale_starts == (1.0,)
+
+
+def test_alpha_appears_once_in_the_state_dict():
+    X, Y = drifting_data(n=10)
+    keys = [k for k in build_model(X, Y).state_dict() if k.endswith("raw_alpha")]
+    assert keys == ["covar_module.kernels.1.raw_alpha"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbo-torch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dynamic Bayesian Optimization for non-stationary human-in-the-loop problems, built on BoTorch"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,7 +45,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = ["ignore::UserWarning"]
+filterwarnings = [
+    # matlab_compatible() switches input scaling off on purpose.
+    "ignore::botorch.exceptions.warnings.InputDataWarning",
+    # Environment-specific: without a C++ compiler BoTorch falls back to Python.
+    "ignore:Failed to compile fused:UserWarning",
+]
 
 [tool.ruff]
 line-length = 100

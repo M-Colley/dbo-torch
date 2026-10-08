@@ -177,6 +177,14 @@ def test_invalid_arguments():
             TemporalDecayKernel(initial_alpha=bad)
 
 
+@pytest.mark.parametrize("parameterization", ["decay", "direct"])
+def test_initial_alpha_of_exactly_one_is_rejected(parameterization):
+    """alpha = 1 is reachable only in a limit where the gradient vanishes, so a
+    fit started there could never move; it must be refused, not frozen."""
+    with pytest.raises(ValueError, match="stationary=True"):
+        TemporalDecayKernel(parameterization=parameterization, initial_alpha=1.0)
+
+
 def test_large_lag_does_not_underflow_to_nan():
     """Long studies produce large lags; alpha ** 1000 must be 0, not NaN."""
     kernel = TemporalDecayKernel()

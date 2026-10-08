@@ -270,3 +270,141 @@ def test_as_stationary_mo_leaves_the_original_config_untouched():
     config = fast_config()
     as_stationary_mo(config)
     assert config.model.stationary is False
+
+
+# -- regressions shared with the single-objective optimiser -------------
+
+
+def test_validation_never_displaces_seed_points():
+    """With the validation period shorter than the seed budget, every seed
+    must still be applied in order and validation must wait for them."""
+    seeds = [[0.0], [3.0], [-3.0]]
+    opt = make_optimizer(seed_points=seeds, validation_every=2)
+    opt.run(drifting_biobjective(noise=0.05), 5)
+
+    applied = [o.x for o in opt.observations[:3]]
+    for got, expected in zip(applied, seeds, strict=True):
+        assert got == pytest.approx(expected)
+    assert [o.iteration for o in opt.observations if o.is_validation] == [4]
+
+
+def test_refit_every_preserves_fitted_hyperparameters():
+    """Iterations that skip the refit must carry every objective's fitted
+    hyperparameters forward, not rebuild at factory defaults."""
+    opt = make_optimizer(refit_every=3)
+    objective = drifting_biobjective(noise=0.05)
+
+    opt.run(objective, 3)
+    opt._ensure_models()  # n = 3: refit
+    fitted = [m.covar_module.kernels[0].base_kernel.lengthscale.detach().clone()
+              for m in opt._models]
+    fitted_alphas = opt.alphas
+
+    x = opt.suggest()
+    opt.observe(x, objective(x))  # n = 4: stale, no refit due
+    opt._ensure_models()
+    carried = [m.covar_module.kernels[0].base_kernel.lengthscale.detach()
+               for m in opt._models]
+
+    for got, expected in zip(carried, fitted, strict=True):
+        torch.testing.assert_close(got, expected)
+    assert opt.alphas == pytest.approx(fitted_alphas)
+
+
+def test_direct_suggest_validation_records_its_own_prediction():
+    """Called directly after an ordinary suggestion, suggest_validation must
+    record its own flag and prediction, not leave the earlier suggestion's
+    pending state to be attached to the validation point."""
+    opt = make_optimizer()
+    objective = drifting_biobjective(noise=0.05)
+    opt.run(objective, 6)
+
+    opt.suggest()
+    x = opt.suggest_validation()
+    expected = list(opt._pending["predicted_y"])
+    obs = opt.observe(x, objective(x))
+
+    assert obs.is_validation is True
+    assert obs.predicted_y == pytest.approx(expected)
+    assert opt.prediction_error()
+
+
+def test_prediction_attached_only_to_the_suggested_input():
+    opt = make_optimizer()
+    opt.run(drifting_biobjective(noise=0.05), 5)
+
+    x = opt.suggest()
+    mismatched = opt.observe([x[0] + 1.0], [1.0, 1.0])
+    assert mismatched.predicted_y is None
+    assert mismatched.is_validation is False
+
+    x = opt.suggest()
+    assert opt.observe(x, [1.0, 1.0]).predicted_y is not None
+
+
+def test_suggest_leaves_the_global_rng_untouched():
+    state = torch.random.get_rng_state()
+    opt = make_optimizer(seed_points=None)
+    opt.run(drifting_biobjective(noise=0.05), 5)
+    assert torch.equal(torch.random.get_rng_state(), state)
+
+
+# -- multi-objective specifics ------------------------------------------
+
+
+def test_acquisition_baseline_has_no_duplicate_inputs(monkeypatch):
+    """Validation re-tests visited inputs, so once the time column is
+    overwritten the raw baseline is guaranteed to contain duplicates."""
+    import dbo_torch.mo_optimizer as mo_module
+
+    real = mo_module.qLogNoisyExpectedHypervolumeImprovement
+    baselines = []
+
+    def spy(*args, **kwargs):
+        baselines.append(kwargs["X_baseline"].clone())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mo_module, "qLogNoisyExpectedHypervolumeImprovement", spy)
+
+    opt = make_optimizer(validation_every=4)
+    opt.run(drifting_biobjective(noise=0.05), 6)
+
+    duplicated = [o.x for o in opt.observations]
+    assert len({tuple(x) for x in duplicated}) < len(duplicated)
+    last = baselines[-1]
+    assert torch.unique(last, dim=0).size(0) == last.size(0)
+
+
+def test_validation_scores_by_upper_bound_and_half_means_posterior_mean():
+    """validation_confidence = 0.5 gives a zero multiplier, so the chosen point
+    is the best hypervolume contributor by posterior mean alone."""
+    opt = make_optimizer(validation_confidence=0.5)
+    opt.run(drifting_biobjective(noise=0.05), 8)
+
+    model = opt._ensure_models()
+    probe = opt._visited_at(opt._acquisition_time())
+    means = opt._posterior_means(model, probe)
+    expected = probe[opt._best_contributor(-means), :1].tolist()
+
+    assert opt.suggest_validation() == pytest.approx(expected)
+
+
+def test_resumed_run_continues_exactly(tmp_path):
+    def cost(x, iteration):
+        a = 4.0 * (1.0 - (iteration - 1) / (N - 1))
+        return [(x[0] - a) ** 2, (x[0] + 2.0) ** 2]
+
+    a = make_optimizer(validation_every=4)
+    for _ in range(5):
+        x = a.suggest()
+        a.observe(x, cost(x, a.next_iteration))
+
+    b = DynamicMOBO.load(a.save(tmp_path / "run.json"))
+    assert b.history() == a.history()
+    assert b.ref_point == a.ref_point
+
+    for _ in range(2):
+        xa, xb = a.suggest(), b.suggest()
+        assert xb == pytest.approx(xa, abs=1e-9)
+        a.observe(xa, cost(xa, a.next_iteration))
+        b.observe(xb, cost(xb, b.next_iteration))
